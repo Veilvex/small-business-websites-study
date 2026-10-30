@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this data, please cite it as below."
+title: "Small business websites on the first page of Google, 2026"
+type: dataset
+authors:
+  - name: "Veilvex"
+    website: "https://veilvex.com"
+date-released: 2026-10-30
+license: CC-BY-4.0
+url: "https://veilvex.com/blog/small-business-websites-study-2026/"
+repository-code: "https://github.com/Veilvex/small-business-websites-study"
+keywords:
+  - small business
+  - websites
+  - SEO
+  - GEO
+  - AI crawlers
+  - open data

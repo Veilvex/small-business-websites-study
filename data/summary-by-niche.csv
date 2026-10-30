@@ -1,0 +1,16 @@
+niche,sites_opened,no_prices_pct,no_messenger_link_pct,whatsapp_pct,blocks_ai_crawlers_pct,tap_to_call_pct,contact_form_pct
+accounting,10,60,90,10,60,90,80
+auto,10,70,50,50,0,100,70
+beauty,25,20,56,40,0,72,52
+cleaning,7,14,86,14,0,86,43
+dental,23,43,4,83,0,96,96
+education,8,50,25,75,0,88,75
+fitness,12,33,42,58,17,50,42
+health,4,75,25,75,25,100,50
+legal,7,86,100,0,0,86,86
+moving,8,50,38,62,12,100,75
+photo,5,60,80,20,40,0,60
+realestate,6,17,17,67,0,100,67
+restaurant,5,80,80,20,0,100,60
+trades,20,50,60,40,0,100,50
+vet,7,100,100,0,0,100,57
