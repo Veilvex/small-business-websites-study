@@ -6,6 +6,14 @@ authors:
   - name: "Veilvex"
     website: "https://veilvex.com"
 date-released: 2026-10-30
+doi: 10.5281/zenodo.23809690
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23809690
+    description: Concept DOI (all versions)
+  - type: doi
+    value: 10.5281/zenodo.23809691
+    description: Version 1.0.0
 license: CC-BY-4.0
 url: "https://veilvex.com/blog/small-business-websites-study-2026/"
 repository-code: "https://github.com/Veilvex/small-business-websites-study"

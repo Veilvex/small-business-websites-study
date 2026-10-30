@@ -1,5 +1,7 @@
 # Small business websites on the first page of Google (2026)
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23809690.svg)](https://doi.org/10.5281/zenodo.23809690)
+
 Open data from a study by [Veilvex](https://veilvex.com): in October 2026 we checked **178 small business websites** that rank on the first page of Google in **24 cities** and **15 niches** (dentists, plumbers, salons, lawyers, accountants, vets and more).
 
 Full write-up: **[We checked 178 small business websites from the first page of Google. Here is what they miss](https://veilvex.com/blog/small-business-websites-study-2026/)**
@@ -45,7 +47,7 @@ This is a snapshot of first-page results, not a random sample of all businesses:
 
 Data: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Please link to the [study page](https://veilvex.com/blog/small-business-websites-study-2026/) when you reuse it. Code: MIT.
 
-> Veilvex (2026). *Small business websites on the first page of Google, 2026* [Data set]. https://veilvex.com/blog/small-business-websites-study-2026/
+> Veilvex (2026). *Small business websites on the first page of Google, 2026* [Data set]. Zenodo. https://doi.org/10.5281/zenodo.23809690
 
 ---
 
