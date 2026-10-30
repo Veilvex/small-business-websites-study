@@ -1,0 +1,14 @@
+{
+  "title": "Small business websites on the first page of Google, 2026",
+  "upload_type": "dataset",
+  "description": "<p>Open dataset from a study by Veilvex: 178 small-business websites from the first page of Google in 24 cities worldwide, checked in October 2026 for HTTPS, mobile viewport, title and meta description, tap-to-call, WhatsApp and Telegram links, contact forms, prices, structured data (JSON-LD, LocalBusiness), AI crawler blocking, load time and page weight. 157 sites opened. Includes the anonymized CSV, summaries by niche and city, and the checking script.</p><p>Article: <a href=\"https://veilvex.com/blog/small-business-websites-study-2026/\">https://veilvex.com/blog/small-business-websites-study-2026/</a></p>",
+  "creators": [{ "name": "Veilvex" }],
+  "license": "cc-by-4.0",
+  "keywords": ["small business", "websites", "SEO", "GEO", "AI search", "AI crawlers", "structured data", "open data"],
+  "related_identifiers": [
+    { "identifier": "https://veilvex.com/blog/small-business-websites-study-2026/", "relation": "isDocumentedBy", "resource_type": "publication-other" },
+    { "identifier": "https://veilvex.com/data/small-business-websites-2026.csv", "relation": "isIdenticalTo", "resource_type": "dataset" }
+  ],
+  "language": "eng",
+  "access_right": "open"
+}
