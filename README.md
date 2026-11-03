@@ -43,6 +43,10 @@ We searched Google for typical local queries (for example a dental clinic in Dub
 
 This is a snapshot of first-page results, not a random sample of all businesses: sites that already rank well are usually in better shape than average. The data is anonymized: names and addresses of the businesses are not published.
 
+## Related research
+
+- **[Who does AI recommend? We checked 60 local businesses](https://veilvex.com/blog/ai-recommendations-local-business-study-2026/)** (November 2026). We asked an AI assistant with web search for the best business in 6 niches and 5 cities and compared the answers with 60 Google Maps leaders. It named 9 of 60 (15%); a top-10 Google position for "niche + city" mattered more than the Maps position (28% vs 10%). Summary data: [CSV](https://veilvex.com/data/ai-recommendations-local-business-2026.csv), CC BY 4.0.
+
 ## License and citation
 
 Data: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Please link to the [study page](https://veilvex.com/blog/small-business-websites-study-2026/) when you reuse it. Code: MIT.
