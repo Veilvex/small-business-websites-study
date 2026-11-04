@@ -1,0 +1,22 @@
+group_type,group,businesses,named_by_ai,share_named_pct
+all,"all",60,9,15
+maps_place,"top (1st or 2nd)",30,5,17
+maps_place,"6th",30,4,13
+niche,"dentist",10,1,10
+niche,"beauty salon",10,1,10
+niche,"auto repair",10,1,10
+niche,"lawyer",10,0,0
+niche,"restaurant",10,0,0
+niche,"gym",10,6,60
+city,"Toronto",12,2,17
+city,"London",12,3,25
+city,"Sydney",12,1,8
+city,"Chicago",12,2,17
+city,"Dublin",12,1,8
+google_niche_city_top10,"yes",18,5,28
+google_niche_city_top10,"no",42,4,10
+google_best_query_top10,"yes",12,3,25
+google_best_query_top10,"no",48,6,12
+second_ai_subset,"named by Gemini (2 Nov)",23,6,26
+second_ai_subset,"named by Claude (3 Nov)",23,3,13
+second_ai_subset,"named by both",23,0,0

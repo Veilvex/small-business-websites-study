@@ -45,7 +45,7 @@ This is a snapshot of first-page results, not a random sample of all businesses:
 
 ## Related research
 
-- **[Who does AI recommend? We checked 60 local businesses](https://veilvex.com/blog/ai-recommendations-local-business-study-2026/)** (November 2026). We asked an AI assistant with web search for the best business in 6 niches and 5 cities and compared the answers with 60 Google Maps leaders. It named 9 of 60 (15%); a top-10 Google position for "niche + city" mattered more than the Maps position (28% vs 10%). Summary data: [CSV](https://veilvex.com/data/ai-recommendations-local-business-2026.csv), CC BY 4.0.
+- **[Who does AI recommend? We checked 60 local businesses](https://veilvex.com/blog/ai-recommendations-local-business-study-2026/)** (November 2026). We asked an AI assistant with web search for the best business in 6 niches and 5 cities and compared the answers with 60 Google Maps leaders. It named 9 of 60 (15%); a top-10 Google position for "niche + city" mattered more than the Maps position (28% vs 10%). Summary data: [CSV](https://veilvex.com/data/ai-recommendations-local-business-2026.csv), CC BY 4.0, also in this repo: [`ai-recommendations-2026/`](ai-recommendations-2026/).
 
 ## License and citation
 
