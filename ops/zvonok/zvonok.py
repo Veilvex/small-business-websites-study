@@ -7,6 +7,8 @@
   Трубку кладёт только Арз. Долгие вопросы: «перезвоню», делаем в фоне, потом перезваниваем.
 - Не взял или сбросил: отправляем оповещение текстом, как раньше.
 - Арз может сам позвонить на @veilvex_manager: сервис возьмёт трубку.
+- Арз пишет или шлёт голосовое в чат: отвечаем текстом или голосовым (как спросил),
+  поручения уходят в канал-очередь как «📌 Задача от Арза из чата», команда их забирает.
 """
 import asyncio
 import json
@@ -56,6 +58,7 @@ BATCH_WAIT = int(env("BATCH_WAIT", "15"))
 SILENCE_ASK_MIN = float(env("SILENCE_ASK_MIN", "3"))
 SILENCE_END_MIN = float(env("SILENCE_END_MIN", "15"))
 MAX_CALL_MIN = float(env("MAX_CALL_MIN", "90"))
+NOISE_GATE = float(env("NOISE_GATE", "900"))  # пока бот говорит, тише этого (и 4× фона) = шум, не перебивает
 QUIET_HOURS = env("QUIET_HOURS", "")  # пример "00-08": в эти часы МСК без звонка, сразу текст
 STATE = Path(env("STATE_FILE", "state.json"))
 BOT_MARK = "🤖"  # сообщения сервиса в очереди, их не обрабатываем
@@ -241,6 +244,8 @@ class CallSession:
         self.transcript = []  # (кто, текст)
         self.pending_text = []  # текст, который надо сказать (результаты фоновых задач)
         self.tasks = []
+        self.noise = 200.0    # уровень фонового шума у Арза (среднее по тихим кускам)
+        self.last_out = 0.0   # когда бот последний раз говорил
 
     # --- Telegram -> Gemini ---
     def on_frames(self, frames):
@@ -250,8 +255,15 @@ class CallSession:
                 self.asked_alive = False
             self.in_buf += f.frame
         if len(self.in_buf) >= FRAME_10MS * 5 and self.live:  # пачками по 50 мс
-            chunk = down_48_to_16(bytes(self.in_buf))
+            raw = bytes(self.in_buf)
             self.in_buf.clear()
+            r = rms(raw)
+            if r < self.noise * 2.5:
+                self.noise = max(50.0, self.noise * 0.95 + r * 0.05)
+            bot_talks = len(self.out) > 0 or time.monotonic() - self.last_out < 0.5
+            if bot_talks and r < max(NOISE_GATE, self.noise * 4):
+                raw = b"\x00" * len(raw)  # фоновый шум не должен перебивать бота, перебивает только голос Арза
+            chunk = down_48_to_16(raw)
             asyncio.create_task(self._send_audio(chunk))
 
     async def _send_audio(self, chunk):
@@ -279,7 +291,7 @@ class CallSession:
                 if len(self.out) >= FRAME_10MS:
                     fr = bytes(self.out[:FRAME_10MS])
                     del self.out[:FRAME_10MS]
-                    self.last_voice = time.monotonic()
+                    self.last_voice = self.last_out = time.monotonic()
                 else:
                     fr = SILENCE_10MS
                 try:
@@ -301,6 +313,11 @@ class CallSession:
             output_audio_transcription=gt.AudioTranscriptionConfig(),
             session_resumption=gt.SessionResumptionConfig(handle=self.handle),
             context_window_compression=gt.ContextWindowCompressionConfig(sliding_window=gt.SlidingWindow()),
+            # реже срабатывать на шум: начало речи с низкой чувствительностью, нужна сплошная речь 300 мс
+            realtime_input_config=gt.RealtimeInputConfig(automatic_activity_detection=gt.AutomaticActivityDetection(
+                start_of_speech_sensitivity=gt.StartSensitivity.START_SENSITIVITY_LOW,
+                end_of_speech_sensitivity=gt.EndSensitivity.END_SENSITIVITY_LOW,
+                prefix_padding_ms=300, silence_duration_ms=800)),
         )
 
     async def gemini_loop(self, ready: asyncio.Event):
@@ -530,6 +547,253 @@ async def incoming(arz_called: ChatUpdate):
             current = None
 
 
+# ---------- чат: Арз пишет или шлёт голосовое в @veilvex_manager ----------
+STT_MODELS = env("STT_MODELS", "gemini-3.5-flash,gemini-2.5-flash,gemini-3.8-flash").split(",")
+TTS_MODELS = env("TTS_MODELS", "gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts,"
+                 "gemini-3.8-flash-tts").split(",")
+CHAT_MODEL = env("CHAT_MODEL", "claude-opus-5-5")
+CHAT_WAIT = float(env("CHAT_WAIT", "3"))  # подождать, вдруг Арз пишет несколько сообщений подряд
+
+chat_q: asyncio.Queue = asyncio.Queue()
+
+CHAT_SYSTEM = """Ты помощник команды Veilvex в Telegram-чате с владельцем, его зовут Арз.
+Отвечай только по-русски (если Арз пишет по-азербайджански, отвечай по-азербайджански).
+Пиши коротко и по-человечески, как в мессенджере: 1-4 предложения, без markdown, без звёздочек, без списков,
+если можно без них. Обращайся «Мистер Арз» только в начале разговора, дальше просто по делу.
+Что ты умеешь:
+- Отвечать на вопросы про работу команды по новостям ниже. Не знаешь: так и скажи.
+- Искать в интернете (web_search), когда нужны свежие факты, цены, новости.
+- peredat_komande: когда Арз даёт поручение (сделать что-то на сайте, написать клиенту, найти, запустить
+  работу, поменять настройку). Сформулируй задачу полностью, со всеми деталями из его слов,
+  вызови инструмент и коротко скажи, что передал команде и они займутся.
+- pozvonit: когда Арз просит позвонить ему (сейчас или через N минут).
+Строки «[сделано: …]» в истории значат, что это уже сделано: не повторяй и не говори, что не сделал.
+Правила: не выдумывай факты, цифры, результаты и сроки. Не обещай того, что команда не подтвердила.
+Сейчас {now} МСК.
+
+Последние новости команды (время МСК):
+{recent}
+"""
+
+CHAT_TOOLS = [
+    {"type": "web_search_20260209", "name": "web_search", "max_uses": 5},
+    {"name": "peredat_komande",
+     "description": "Передать поручение Арза команде агентов Claude. Они возьмут его в работу и сообщат результат.",
+     "input_schema": {"type": "object", "properties": {
+         "zadacha": {"type": "string", "description": "Поручение полностью, по-русски, со всеми деталями"}},
+         "required": ["zadacha"]}},
+    {"name": "pozvonit",
+     "description": "Позвонить Арзу голосом в Telegram: сейчас (minuty=0) или через N минут.",
+     "input_schema": {"type": "object", "properties": {
+         "minuty": {"type": "number"},
+         "zachem": {"type": "string", "description": "О чём поговорить, коротко"}},
+         "required": ["minuty"]}},
+]
+
+
+def pcm_to_ogg(pcm: bytes, rate=24000) -> bytes:
+    """Сырые 16-бит моно → OGG Opus (голосовое Telegram). Без ffmpeg, через PyAV."""
+    import io
+    import av
+    buf = io.BytesIO()
+    out = av.open(buf, "w", format="ogg")
+    st = out.add_stream("libopus", rate=48000)
+    st.layout = "mono"
+    res = av.AudioResampler(format="s16", layout="mono", rate=48000)
+    fr = av.AudioFrame.from_ndarray(np.frombuffer(pcm, dtype=np.int16).reshape(1, -1), format="s16", layout="mono")
+    fr.sample_rate = rate
+    for f in res.resample(fr):
+        for p in st.encode(f):
+            out.mux(p)
+    for f in res.resample(None) or []:
+        for p in st.encode(f):
+            out.mux(p)
+    for p in st.encode(None):
+        out.mux(p)
+    out.close()
+    return buf.getvalue()
+
+
+async def speech_to_text(data: bytes, mime: str) -> str:
+    last = None
+    for m in STT_MODELS:
+        try:
+            r = await gem.aio.models.generate_content(model=m.strip(), contents=[
+                gt.Part.from_bytes(data=data, mime_type=mime or "audio/ogg"),
+                "Распознай речь дословно (русский или азербайджанский). Верни только текст, без пояснений."])
+            if r.text and r.text.strip():
+                return r.text.strip()
+        except Exception as e:
+            last = e
+            log.warning("STT %s: %s", m, e)
+    raise RuntimeError(f"не распознал голос: {last}")
+
+
+async def text_to_voice(text: str) -> bytes:
+    last = None
+    for m in TTS_MODELS:
+        try:
+            r = await gem.aio.models.generate_content(
+                model=m.strip(), contents=f"Скажи спокойно и дружелюбно, по-русски: {text}",
+                config=gt.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=gt.SpeechConfig(voice_config=gt.VoiceConfig(
+                        prebuilt_voice_config=gt.PrebuiltVoiceConfig(voice_name=VOICE)))))
+            part = r.candidates[0].content.parts[0].inline_data
+            rate = 24000
+            if part.mime_type and "rate=" in part.mime_type:
+                rate = int(part.mime_type.split("rate=")[1].split(";")[0])
+            return await asyncio.to_thread(pcm_to_ogg, part.data, rate)
+        except Exception as e:
+            last = e
+            log.warning("TTS %s: %s", m, e)
+    raise RuntimeError(f"не озвучил: {last}")
+
+
+def chat_history():
+    return state.setdefault("chat", [])
+
+
+def chat_remember(role, text):
+    h = chat_history()
+    h.append({"r": role, "x": text[:2000], "t": now_msk().strftime("%d.%m %H:%M")})
+    state["chat"] = h[-16:]
+    save_state(state)
+
+
+chat_done = []  # что сделал помощник за этот ответ (чтобы помнил и не повторял)
+
+
+async def run_chat_tool(name, args):
+    global callback_task
+    if name == "peredat_komande":
+        z = (args.get("zadacha") or "").strip()
+        await post_queue(f"📌 Задача от Арза из чата: {z}")
+        chat_done.append(f"передал команде: {z[:300]}")
+        return "передано команде, они возьмут в работу и сообщат результат"
+    if name == "pozvonit":
+        mins = float(args.get("minuty") or 0)
+        why = args.get("zachem", "")
+        if mins <= 0:
+            await notice_q.put({"callback": True, "text": f"Арз в чате попросил позвонить. {why}".strip()})
+            chat_done.append("поставил звонок сейчас")
+            return "звоню сейчас"
+        if callback_task and not callback_task.done():
+            callback_task.cancel()
+        callback_task = asyncio.create_task(delayed_callback(mins, why))
+        await post_queue(f"Перезвоню Арзу через {mins:g} мин (просьба из чата). {why}")
+        chat_done.append(f"поставил звонок через {mins:g} мин")
+        return f"позвоню через {mins:g} мин"
+    return "нет такого инструмента"
+
+
+async def chat_answer(content) -> str:
+    """content: блоки сообщения Арза для Claude. Возвращает текст ответа."""
+    recent = "\n".join(f"{r['t']}: {r['x']}" for r in state["recent"][-15:]) or "пока нет"
+    msgs = []
+    for h in chat_history()[-12:]:
+        role = "user" if h["r"] == "arz" else "assistant"
+        if msgs and msgs[-1]["role"] == role:
+            msgs[-1]["content"] += "\n" + h["x"]
+        else:
+            msgs.append({"role": role, "content": h["x"]})
+    if msgs and msgs[0]["role"] == "assistant":
+        msgs = msgs[1:]
+    if msgs and msgs[-1]["role"] == "user":  # последнее сообщение Арза пришлём ниже с картинками
+        msgs.pop()
+    msgs.append({"role": "user", "content": content})
+    sysp = CHAT_SYSTEM.format(now=now_msk().strftime("%d.%m %H:%M"), recent=recent)
+    r = None
+    for _ in range(6):
+        r = await claude.messages.create(model=CHAT_MODEL, max_tokens=3000, system=sysp,
+                                         output_config={"effort": "medium"}, tools=CHAT_TOOLS, messages=msgs)
+        if r.stop_reason == "pause_turn":
+            msgs.append({"role": "assistant", "content": r.content})
+            continue
+        if r.stop_reason == "tool_use":
+            msgs.append({"role": "assistant", "content": r.content})
+            results = []
+            for b in r.content:
+                if b.type == "tool_use":
+                    try:
+                        out = await run_chat_tool(b.name, b.input or {})
+                    except Exception as e:
+                        out = f"ошибка: {e}"
+                    results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+            msgs.append({"role": "user", "content": results})
+            continue
+        break
+    text = "".join(b.text for b in r.content if b.type == "text") if r else ""
+    return text.replace("**", "").replace("*", "").strip() or "Понял."
+
+
+async def handle_chat(batch):
+    """batch: несколько сообщений Арза подряд. Голос → отвечаем голосом, текст → текстом."""
+    voice_in = any(m.voice or m.video_note for m in batch)
+    parts, plain = [], []
+    for m in batch:
+        try:
+            if m.voice or m.video_note or (m.audio and not m.message):
+                data = await m.download_media(file=bytes)
+                mime = "video/mp4" if m.video_note else (m.file.mime_type or "audio/ogg")
+                said = await speech_to_text(data, mime)
+                plain.append(f"(голосом) {said}")
+            elif m.photo or (m.document and (m.file.mime_type or "").startswith("image/")):
+                import base64
+                data = await m.download_media(file=bytes)
+                mime = m.file.mime_type if m.document else "image/jpeg"
+                parts.append({"type": "image", "source": {"type": "base64", "media_type": mime,
+                                                          "data": base64.b64encode(data).decode()}})
+                plain.append(f"(картинка) {m.message or ''}".strip())
+            elif m.message:
+                plain.append(m.message)
+            elif m.document:
+                plain.append(f"(прислал файл {m.file.name or ''}, читать файлы в чате пока не умею)")
+        except Exception as e:
+            log.exception("чат: не смог разобрать сообщение")
+            plain.append(f"(сообщение не разобрал: {type(e).__name__})")
+    said = "\n".join(p for p in plain if p)
+    if not said and not parts:
+        return
+    chat_remember("arz", said)
+    chat_done.clear()
+    log.info("чат от Арза: %s", said[:120])
+    try:
+        async with tg.action(ARZ_ID, "record-voice" if voice_in else "typing"):
+            answer = await chat_answer(parts + [{"type": "text", "text": said or "(без текста)"}])
+            ogg = None
+            if voice_in:
+                try:
+                    ogg = await text_to_voice(answer)
+                except Exception as e:
+                    log.warning("голосом не вышло, отвечу текстом: %s", e)
+    except Exception as e:
+        log.exception("чат: ответ")
+        answer, ogg = f"Не получилось ответить сейчас ({type(e).__name__}). Передал команде.", None
+        await post_queue(f"📌 Задача от Арза из чата (ответ не сработал, ошибка {type(e).__name__}): {said}")
+    chat_remember("me", answer + "".join(f"\n[сделано: {d}]" for d in chat_done))
+    if ogg:
+        import io
+        f = io.BytesIO(ogg)
+        f.name = "otvet.ogg"
+        await tg.send_file(ARZ_ID, f, voice_note=True)
+    else:
+        await text_arz(answer)
+    await post_queue(f"Чат. Арз: {said[:1500]}\nОтвет: {answer[:1500]}")
+
+
+async def chat_worker():
+    while True:
+        batch = [await chat_q.get()]
+        await asyncio.sleep(CHAT_WAIT)
+        while not chat_q.empty():
+            batch.append(chat_q.get_nowait())
+        try:
+            await handle_chat(batch)
+        except Exception:
+            log.exception("chat_worker")
+
+
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     await tg.start()
@@ -561,6 +825,10 @@ async def main():
         log.info("перехватил оповещение для звонка: %s", t[:80])
         await notice_q.put({"callback": False, "text": t})
 
+    @tg.on(events.NewMessage(chats=ARZ_ID, incoming=True))
+    async def _from_arz(ev):
+        await chat_q.put(ev.message)
+
     @calls.on_update(ptf.stream_frame(Direction.INCOMING))
     async def _frames(_, u: StreamFrames):
         if current and u.chat_id == ARZ_ID:
@@ -582,7 +850,7 @@ async def main():
         state["last_id"] = last[0].id if last else 0
         save_state(state)
     await pick_live_model()
-    await asyncio.gather(worker(), poll_queue(), tg.run_until_disconnected())
+    await asyncio.gather(worker(), poll_queue(), chat_worker(), tg.run_until_disconnected())
 
 
 if __name__ == "__main__":
