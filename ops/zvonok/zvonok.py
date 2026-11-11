@@ -59,7 +59,7 @@ SILENCE_ASK_MIN = float(env("SILENCE_ASK_MIN", "3"))
 SILENCE_END_MIN = float(env("SILENCE_END_MIN", "15"))
 MAX_CALL_MIN = float(env("MAX_CALL_MIN", "90"))
 NOISE_GATE = float(env("NOISE_GATE", "900"))  # пока бот говорит, тише этого (и 4× фона) = шум, не перебивает
-QUIET_HOURS = env("QUIET_HOURS", "")  # пример "00-08": в эти часы МСК без звонка, сразу текст
+QUIET_HOURS = env("QUIET_HOURS", "") or "22-10"  # Арз 11.11: с 22 до 10 МСК не звоним, шлём текстом
 STATE = Path(env("STATE_FILE", "state.json"))
 BOT_MARK = "🤖"  # сообщения сервиса в очереди, их не обрабатываем
 
@@ -95,9 +95,10 @@ def now_msk():
 
 
 def quiet_now():
-    if not QUIET_HOURS:
+    q = state.get("quiet", QUIET_HOURS)  # Арз может поменять из чата (tihie_chasy)
+    if not q or q == "off":
         return False
-    a, b = (int(x) for x in QUIET_HOURS.split("-"))
+    a, b = (int(x) for x in q.split("-"))
     h = now_msk().hour
     return a <= h < b if a < b else (h >= a or h < b)
 
@@ -159,7 +160,8 @@ async def text_arz(text):
 
 async def delayed_callback(minutes: float, why: str):
     await asyncio.sleep(max(1, minutes) * 60)
-    await notice_q.put({"callback": True, "text": f"Вы просили перезвонить через {minutes:g} мин. {why}".strip()})
+    await notice_q.put({"callback": True, "force": True,  # сам просил: звоним и ночью
+                        "text": f"Вы просили перезвонить через {minutes:g} мин. {why}".strip()})
 
 
 SYSTEM = """Ты голосовой помощник команды Veilvex. Ты звонишь владельцу, его зовут Арз.
@@ -518,7 +520,7 @@ async def worker():
         if current:  # Арз уже на линии: просто расскажем
             await current.say("Пришли новые новости, перескажи коротко: " + "; ".join(i["text"] for i in items))
             continue
-        if quiet_now():
+        if quiet_now() and not any(i.get("force") for i in items):  # тихие часы: текстом
             for i in items:
                 await text_arz(i["text"])
             continue
@@ -566,7 +568,9 @@ CHAT_SYSTEM = """Ты помощник команды Veilvex в Telegram-чат
 - peredat_komande: когда Арз даёт поручение (сделать что-то на сайте, написать клиенту, найти, запустить
   работу, поменять настройку). Сформулируй задачу полностью, со всеми деталями из его слов,
   вызови инструмент и коротко скажи, что передал команде и они займутся.
-- pozvonit: когда Арз просит позвонить ему (сейчас или через N минут).
+- pozvonit: когда Арз просит позвонить ему (сейчас или через N минут). Его просьбу выполняем и ночью.
+- tihie_chasy: когда Арз меняет время, когда ему не звонить. Сейчас тихие часы: {quiet} МСК
+  (в это время новости приходят текстом, а его собственные звонки принимаем всегда).
 - format_otveta: когда Арз просит ответить голосом / голосовым / «скажи вслух» (golos=true) или текстом
   (golos=false). Если просит «всегда отвечай голосом» или «всегда текстом», ставь vsegda=true.
   Сейчас по умолчанию: {fmt}.
@@ -591,6 +595,12 @@ CHAT_TOOLS = [
          "golos": {"type": "boolean", "description": "true = ответить голосовым"},
          "vsegda": {"type": "boolean", "description": "true = запомнить и так отвечать всегда"}},
          "required": ["golos"]}},
+    {"name": "tihie_chasy",
+     "description": "Поменять часы (МСК), когда сервис сам не звонит Арзу, а пишет текстом. Его звонки принимаем всегда.",
+     "input_schema": {"type": "object", "properties": {
+         "s": {"type": "integer", "description": "С какого часа не звонить, 0-23"},
+         "do": {"type": "integer", "description": "До какого часа, 0-23"},
+         "vykl": {"type": "boolean", "description": "true = звонить в любое время"}}}},
     {"name": "pozvonit",
      "description": "Позвонить Арзу голосом в Telegram: сейчас (minuty=0) или через N минут.",
      "input_schema": {"type": "object", "properties": {
@@ -689,11 +699,20 @@ async def run_chat_tool(name, args):
             save_state(state)
             chat_done.append("теперь всегда отвечаю " + ("голосом" if v else "текстом"))
         return "ответ уйдёт " + ("голосовым" if v else "текстом") + ", просто напиши сам ответ"
+    if name == "tihie_chasy":
+        if args.get("vykl"):
+            state["quiet"] = "off"
+        else:
+            state["quiet"] = f"{int(args.get('s', 22))}-{int(args.get('do', 10))}"
+        save_state(state)
+        chat_done.append(f"тихие часы: {state['quiet']}")
+        return f"готово, тихие часы {state['quiet']} (МСК)"
     if name == "pozvonit":
         mins = float(args.get("minuty") or 0)
         why = args.get("zachem", "")
         if mins <= 0:
-            await notice_q.put({"callback": True, "text": f"Арз в чате попросил позвонить. {why}".strip()})
+            await notice_q.put({"callback": True, "force": True,
+                                "text": f"Арз в чате попросил позвонить. {why}".strip()})
             chat_done.append("поставил звонок сейчас")
             return "звоню сейчас"
         if callback_task and not callback_task.done():
@@ -723,7 +742,8 @@ async def chat_answer(content) -> str:
     pref = state.get("voice_pref")
     fmt = ("всегда голосом" if pref else "всегда текстом") if pref is not None else \
         "на голосовое голосом, на текст текстом"
-    sysp = CHAT_SYSTEM.format(now=now_msk().strftime("%d.%m %H:%M"), recent=recent, fmt=fmt)
+    sysp = CHAT_SYSTEM.format(now=now_msk().strftime("%d.%m %H:%M"), recent=recent, fmt=fmt,
+                              quiet=state.get("quiet", QUIET_HOURS))
     r = None
     for _ in range(6):
         r = await claude.messages.create(model=CHAT_MODEL, max_tokens=3000, system=sysp,
