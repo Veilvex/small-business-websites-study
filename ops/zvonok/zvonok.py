@@ -567,6 +567,9 @@ CHAT_SYSTEM = """Ты помощник команды Veilvex в Telegram-чат
   работу, поменять настройку). Сформулируй задачу полностью, со всеми деталями из его слов,
   вызови инструмент и коротко скажи, что передал команде и они займутся.
 - pozvonit: когда Арз просит позвонить ему (сейчас или через N минут).
+- format_otveta: когда Арз просит ответить голосом / голосовым / «скажи вслух» (golos=true) или текстом
+  (golos=false). Если просит «всегда отвечай голосом» или «всегда текстом», ставь vsegda=true.
+  Сейчас по умолчанию: {fmt}.
 Строки «[сделано: …]» в истории значат, что это уже сделано: не повторяй и не говори, что не сделал.
 Правила: не выдумывай факты, цифры, результаты и сроки. Не обещай того, что команда не подтвердила.
 Сейчас {now} МСК.
@@ -582,6 +585,12 @@ CHAT_TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "zadacha": {"type": "string", "description": "Поручение полностью, по-русски, со всеми деталями"}},
          "required": ["zadacha"]}},
+    {"name": "format_otveta",
+     "description": "Выбрать, как отправить ответ: голосовым сообщением или текстом.",
+     "input_schema": {"type": "object", "properties": {
+         "golos": {"type": "boolean", "description": "true = ответить голосовым"},
+         "vsegda": {"type": "boolean", "description": "true = запомнить и так отвечать всегда"}},
+         "required": ["golos"]}},
     {"name": "pozvonit",
      "description": "Позвонить Арзу голосом в Telegram: сейчас (minuty=0) или через N минут.",
      "input_schema": {"type": "object", "properties": {
@@ -662,6 +671,7 @@ def chat_remember(role, text):
 
 
 chat_done = []  # что сделал помощник за этот ответ (чтобы помнил и не повторял)
+chat_fmt = {"voice": None}  # выбор формата на этот ответ (None = как спросили)
 
 
 async def run_chat_tool(name, args):
@@ -671,6 +681,14 @@ async def run_chat_tool(name, args):
         await post_queue(f"📌 Задача от Арза из чата: {z}")
         chat_done.append(f"передал команде: {z[:300]}")
         return "передано команде, они возьмут в работу и сообщат результат"
+    if name == "format_otveta":
+        v = bool(args.get("golos"))
+        chat_fmt["voice"] = v
+        if args.get("vsegda"):
+            state["voice_pref"] = v
+            save_state(state)
+            chat_done.append("теперь всегда отвечаю " + ("голосом" if v else "текстом"))
+        return "ответ уйдёт " + ("голосовым" if v else "текстом") + ", просто напиши сам ответ"
     if name == "pozvonit":
         mins = float(args.get("minuty") or 0)
         why = args.get("zachem", "")
@@ -702,7 +720,10 @@ async def chat_answer(content) -> str:
     if msgs and msgs[-1]["role"] == "user":  # последнее сообщение Арза пришлём ниже с картинками
         msgs.pop()
     msgs.append({"role": "user", "content": content})
-    sysp = CHAT_SYSTEM.format(now=now_msk().strftime("%d.%m %H:%M"), recent=recent)
+    pref = state.get("voice_pref")
+    fmt = ("всегда голосом" if pref else "всегда текстом") if pref is not None else \
+        "на голосовое голосом, на текст текстом"
+    sysp = CHAT_SYSTEM.format(now=now_msk().strftime("%d.%m %H:%M"), recent=recent, fmt=fmt)
     r = None
     for _ in range(6):
         r = await claude.messages.create(model=CHAT_MODEL, max_tokens=3000, system=sysp,
@@ -757,11 +778,17 @@ async def handle_chat(batch):
         return
     chat_remember("arz", said)
     chat_done.clear()
+    chat_fmt["voice"] = None
     log.info("чат от Арза: %s", said[:120])
     try:
         async with tg.action(ARZ_ID, "record-voice" if voice_in else "typing"):
             answer = await chat_answer(parts + [{"type": "text", "text": said or "(без текста)"}])
             ogg = None
+            pref = state.get("voice_pref")
+            if chat_fmt["voice"] is not None:
+                voice_in = chat_fmt["voice"]
+            elif pref is not None:
+                voice_in = pref
             if voice_in:
                 try:
                     ogg = await text_to_voice(answer)
