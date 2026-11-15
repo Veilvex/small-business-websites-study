@@ -864,7 +864,7 @@ def chat_kind(chat_id):
     return None
 
 
-TOOLS = [
+MCP_TOOLS = [
     {"name": "send_message",
      "description": "Оповещение Арзу: chat_id 7230838320 (сначала звонок, если не возьмёт, придёт текстом; "
                     "в тихие часы сразу текст). Или сообщение в канал-очередь звонков: chat_id -1004477257195. "
@@ -936,7 +936,7 @@ async def mcp_one(m):
     if meth == "ping":
         return ok({})
     if meth == "tools/list":
-        return ok({"tools": TOOLS})
+        return ok({"tools": MCP_TOOLS})
     if meth in ("resources/list", "prompts/list"):
         return ok({meth.split("/")[0]: []})
     if meth == "tools/call":
