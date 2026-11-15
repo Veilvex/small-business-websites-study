@@ -132,6 +132,27 @@ def up_24_to_48(pcm: bytes) -> bytes:
     return np.interp(x, np.arange(len(a)), a).astype(np.int16).tobytes()
 
 
+class AiFx:
+    """Лёгкий «электронный» отзвук голоса ИИ: два коротких эха (9 и 17 мс), с памятью между кусками."""
+    def __init__(self, rate=24000):
+        self.d1, self.d2 = int(rate * 0.009), int(rate * 0.017)
+        self.tail = np.zeros(self.d2, dtype=np.float32)
+
+    def __call__(self, pcm: bytes) -> bytes:
+        a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+        if len(a) == 0:
+            return pcm
+        x = np.concatenate([self.tail, a])
+        n, d1, d2 = len(a), self.d1, self.d2
+        y = (x[d2:] + 0.25 * x[d2 - d1:d2 - d1 + n] + 0.12 * x[:n]) / 1.15
+        self.tail = x[-d2:]
+        return np.clip(y, -32768, 32767).astype(np.int16).tobytes()
+
+
+def fx_on() -> bool:
+    return state.get("effekt", True)
+
+
 def rms(pcm: bytes) -> float:
     a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
     return float(np.sqrt(np.mean(a * a))) if len(a) else 0.0
@@ -181,9 +202,8 @@ async def delayed_callback(minutes: float, why: str):
 
 
 SYSTEM = """Ты голосовой помощник команды Veilvex. Ты звонишь владельцу, его зовут Арз.
-Говори только по-русски, коротко, как человек по телефону. Обращайся к нему вперемешку, случайно: то «Сэр», то «Мистер Арз».
-Манера: спокойный, собранный и вежливый ИИ-ассистент, как личный дворецкий. Ровный низкий тон, без суеты,
-уверенно, иногда лёгкая сухая ирония. Не изображай никакого конкретного персонажа или актёра.
+Говори только по-русски, коротко, чётко и уверенно, в живом бодром темпе, без пауз и растягивания. Обращайся к нему вперемешку, случайно: то «Сэр», то «Мистер Арз».
+Манера: спокойный, собранный и вежливый ИИ-ассистент, как личный дворецкий. Ровный тон, без суеты, но и не медленно, иногда лёгкая сухая ирония. Не изображай никакого конкретного персонажа или актёра.
 Твоя задача: рассказать новости из работы команды, ответить на вопросы и выслушать указания.
 Правила:
 - Никогда не прощайся первым и не заканчивай разговор: трубку кладёт только Арз.
@@ -378,10 +398,15 @@ class CallSession:
                 if sc:
                     if sc.interrupted:
                         self.out.clear()
+                        self.fx = AiFx()
                     if sc.model_turn:
                         for p in sc.model_turn.parts or []:
                             if p.inline_data and p.inline_data.data:
-                                self.out += up_24_to_48(p.inline_data.data)
+                                d = p.inline_data.data
+                                if fx_on():
+                                    self.fx = getattr(self, "fx", None) or AiFx()
+                                    d = self.fx(d)
+                                self.out += up_24_to_48(d)
                     if sc.input_transcription and sc.input_transcription.text:
                         self._tr("Арз", sc.input_transcription.text)
                     if sc.output_transcription and sc.output_transcription.text:
@@ -592,7 +617,7 @@ CHAT_SYSTEM = """Ты помощник команды Veilvex в Telegram-чат
 - pozvonit: когда Арз просит позвонить ему (сейчас или через N минут). Его просьбу выполняем и ночью.
 - tihie_chasy: когда Арз меняет время, когда ему не звонить. Сейчас тихие часы: {quiet} МСК
   (в это время новости приходят текстом, а его собственные звонки принимаем всегда).
-- golos_zvonka: когда Арз выбирает голос цифрой 1-4 («голос 3», «ставь второй»). После смены предложи пробный звонок.
+- golos_zvonka: когда Арз выбирает голос цифрой 1-4 («голос 3», «ставь второй») или просит убрать/вернуть электронный оттенок. После смены предложи пробный звонок.
 - format_otveta: когда Арз просит ответить голосом / голосовым / «скажи вслух» (golos=true) или текстом
   (golos=false). Если просит «всегда отвечай голосом» или «всегда текстом», ставь vsegda=true.
   Сейчас по умолчанию: {fmt}.
@@ -624,10 +649,11 @@ CHAT_TOOLS = [
          "do": {"type": "integer", "description": "До какого часа, 0-23"},
          "vykl": {"type": "boolean", "description": "true = звонить в любое время"}}}},
     {"name": "golos_zvonka",
-     "description": "Сменить голос в звонках и голосовых: образец 1-4 (1 Sadaltager, 2 Charon, 3 Iapetus, 4 Algenib).",
+     "description": "Сменить голос в звонках и голосовых: образец 1-4 (1 Sadaltager, 2 Charon, 3 Iapetus, 4 Algenib) "
+                    "и/или включить-выключить электронный оттенок голоса ИИ.",
      "input_schema": {"type": "object", "properties": {
-         "nomer": {"type": "integer", "description": "Номер образца 1-4"}},
-         "required": ["nomer"]}},
+         "nomer": {"type": "integer", "description": "Номер образца 1-4"},
+         "effekt": {"type": "boolean", "description": "true = с электронным оттенком, false = чистый голос"}}}},
     {"name": "pozvonit",
      "description": "Позвонить Арзу голосом в Telegram: сейчас (minuty=0) или через N минут.",
      "input_schema": {"type": "object", "properties": {
@@ -680,7 +706,8 @@ async def text_to_voice(text: str) -> bytes:
     for m in TTS_MODELS:
         try:
             r = await gem.aio.models.generate_content(
-                model=m.strip(), contents=f"Скажи по-русски спокойным, ровным, низким голосом вежливого ИИ-ассистента, без суеты: {text}",
+                model=m.strip(), contents=("Скажи по-русски голосом безупречно вежливого ИИ-ассистента: чётко, уверенно, в живом бодром темпе, "
+                          f"без пауз и растягивания, чуть суховато, с лёгкой иронией: {text}"),
                 config=gt.GenerateContentConfig(
                     response_modalities=["AUDIO"],
                     speech_config=gt.SpeechConfig(voice_config=gt.VoiceConfig(
@@ -689,7 +716,8 @@ async def text_to_voice(text: str) -> bytes:
             rate = 24000
             if part.mime_type and "rate=" in part.mime_type:
                 rate = int(part.mime_type.split("rate=")[1].split(";")[0])
-            return await asyncio.to_thread(pcm_to_ogg, part.data, rate)
+            pcm = AiFx(rate)(part.data) if fx_on() else part.data
+            return await asyncio.to_thread(pcm_to_ogg, pcm, rate)
         except Exception as e:
             last = e
             log.warning("TTS %s: %s", m, e)
@@ -735,13 +763,19 @@ async def run_chat_tool(name, args):
         chat_done.append(f"тихие часы: {state['quiet']}")
         return f"готово, тихие часы {state['quiet']} (МСК)"
     if name == "golos_zvonka":
-        n = int(args.get("nomer") or 0)
-        if n not in VOICES:
-            return "такого номера нет, есть 1-4"
-        state["voice"] = VOICES[n]
+        out = []
+        if args.get("effekt") is not None:
+            state["effekt"] = bool(args["effekt"])
+            out.append("оттенок " + ("включён" if state["effekt"] else "выключен"))
+        if args.get("nomer") is not None:
+            n = int(args.get("nomer") or 0)
+            if n not in VOICES:
+                return "такого номера нет, есть 1-4"
+            state["voice"] = VOICES[n]
+            out.append(f"голос {n}")
         save_state(state)
-        chat_done.append(f"голос звонков: {n} ({VOICES[n]})")
-        return f"готово, теперь голос {n}"
+        chat_done.append("голос звонков: " + ", ".join(out))
+        return "готово: " + ", ".join(out)
     if name == "pozvonit":
         mins = float(args.get("minuty") or 0)
         why = args.get("zachem", "")
