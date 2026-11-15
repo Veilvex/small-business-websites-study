@@ -15,6 +15,7 @@ cp zvonok.py zvonok.py.bak-v61
 PY=$( [ -x venv/bin/python ] && echo venv/bin/python || echo python3 )
 $PY -m py_compile zvonok.py.new || { echo "ошибка компиляции, оставляю старую"; exit 1; }
 mv zvonok.py.new zvonok.py && chown "$U" zvonok.py
+sed -i "s/^VOICE=.*/VOICE=Charon/" .env
 systemctl restart zvonok
 sleep 25
 echo "служба: $(systemctl is-active zvonok)"
