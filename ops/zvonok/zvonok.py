@@ -59,8 +59,8 @@ GEMINI_KEY = env("GEMINI_API_KEY")
 ANTHROPIC_KEY = env("ANTHROPIC_API_KEY")
 LIVE_MODELS = env("LIVE_MODELS", "gemini-3.8-live,gemini-3.1-flash-live-preview,"
                   "gemini-2.5-flash-native-audio-latest").split(",")
-VOICE = env("VOICE", "Sadaltager")
-VOICES = {1: "Sadaltager", 2: "Charon", 3: "Iapetus", 4: "Algenib"}  # образцы golos-1..4.mp3 для Арза
+VOICE = env("VOICE", "Charon")
+VOICES = {1: "Sadaltager", 2: "Charon", 3: "Iapetus", 4: "Algenib"}  # по умолчанию прежний Charon  # образцы golos-1..4.mp3 для Арза
 RING_SEC = int(env("RING_SEC", "45"))
 BATCH_WAIT = int(env("BATCH_WAIT", "15"))
 SILENCE_ASK_MIN = float(env("SILENCE_ASK_MIN", "3"))
@@ -150,7 +150,7 @@ class AiFx:
 
 
 def fx_on() -> bool:
-    return state.get("effekt", True)
+    return state.get("effekt", False)
 
 
 def rms(pcm: bytes) -> float:
@@ -202,8 +202,7 @@ async def delayed_callback(minutes: float, why: str):
 
 
 SYSTEM = """Ты голосовой помощник команды Veilvex. Ты звонишь владельцу, его зовут Арз.
-Говори только по-русски, коротко, чётко и уверенно, в живом бодром темпе, без пауз и растягивания. Обращайся к нему вперемешку, случайно: то «Сэр», то «Мистер Арз».
-Манера: спокойный, собранный и вежливый ИИ-ассистент, как личный дворецкий. Ровный тон, без суеты, но и не медленно, иногда лёгкая сухая ирония. Не изображай никакого конкретного персонажа или актёра.
+Говори только по-русски, живо и коротко, как человек по телефону. Обращайся к нему вперемешку: иногда просто «Сэр», иногда «Мистер Арз».
 Твоя задача: рассказать новости из работы команды, ответить на вопросы и выслушать указания.
 Правила:
 - Никогда не прощайся первым и не заканчивай разговор: трубку кладёт только Арз.
@@ -607,7 +606,6 @@ CHAT_SYSTEM = """Ты помощник команды Veilvex в Telegram-чат
 Отвечай только по-русски (если Арз пишет по-азербайджански, отвечай по-азербайджански).
 Пиши коротко и по-человечески, как в мессенджере: 1-4 предложения, без markdown, без звёздочек, без списков,
 если можно без них. Обращение только в начале разговора, случайно то «Сэр», то «Мистер Арз», дальше просто по делу.
-Манера: спокойный, вежливый, собранный ИИ-ассистент, иногда лёгкая сухая ирония.
 Что ты умеешь:
 - Отвечать на вопросы про работу команды по новостям ниже. Не знаешь: так и скажи.
 - Искать в интернете (web_search), когда нужны свежие факты, цены, новости.
@@ -706,8 +704,7 @@ async def text_to_voice(text: str) -> bytes:
     for m in TTS_MODELS:
         try:
             r = await gem.aio.models.generate_content(
-                model=m.strip(), contents=("Скажи по-русски голосом безупречно вежливого ИИ-ассистента: чётко, уверенно, в живом бодром темпе, "
-                          f"без пауз и растягивания, чуть суховато, с лёгкой иронией: {text}"),
+                model=m.strip(), contents=f"Скажи спокойно и дружелюбно, по-русски: {text}",
                 config=gt.GenerateContentConfig(
                     response_modalities=["AUDIO"],
                     speech_config=gt.SpeechConfig(voice_config=gt.VoiceConfig(
