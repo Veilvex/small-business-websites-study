@@ -541,6 +541,14 @@ async def poll_queue():
 
 
 def intro_for(items):
+    if all(i.get("checkin") for i in items):
+        a = random.choice(("Сэр", "Мистер Арз"))
+        since = [r for r in state["recent"][-8:]]
+        recent = "\n".join(f"- {r['t']}: {r['x']}" for r in since) or "- пока ничего"
+        return (f"Арз взял трубку. Это плановый звонок раз в {checkin_min():g} минут. Начни: «{a}, на связи, "
+                f"плановый звонок». Последние новости команды:\n{recent}\nЕсли среди них нет новых с прошлого звонка, "
+                "коротко скажи, что свежих новостей нет и команда работает. Спроси, есть ли указания, и жди.")
+    items = [i for i in items if not i.get("checkin")]
     news = "\n".join(f"- {i['text']}" for i in items)
     if all(i["callback"] for i in items):
         a = random.choice(("Сэр", "Мистер Арз"))
@@ -551,8 +559,31 @@ def intro_for(items):
             f"без эмодзи:\n{news}\nПотом спроси, есть ли вопросы или указания, и жди.")
 
 
+last_call = time.time()  # когда последний раз говорили по телефону (или пытались)
+CHECKIN_MIN = float(env("CHECKIN_MIN", "15"))  # Арз 15.11: если новостей нет, звонить каждые 15 мин
+
+
+def checkin_min() -> float:
+    return float(state.get("checkin", CHECKIN_MIN))
+
+
+async def checkin_loop():
+    """Плановый звонок: если с прошлого звонка прошло checkin_min() минут, а новостей не было."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            m = checkin_min()
+            if m <= 0 or current or call_lock.locked() or quiet_now() or not notice_q.empty():
+                continue
+            if time.time() - last_call >= m * 60:
+                await notice_q.put({"callback": True, "checkin": True,
+                                    "text": f"Плановый звонок раз в {m:g} мин."})
+        except Exception:
+            log.exception("плановый звонок")
+
+
 async def worker():
-    global current
+    global current, last_call
     while True:
         items = [await notice_q.get()]
         await asyncio.sleep(BATCH_WAIT)  # собрать несколько новостей в один звонок
@@ -561,6 +592,10 @@ async def worker():
         for i in items:
             if not i["callback"]:
                 remember(i["text"])
+        if all(i.get("checkin") for i in items) and (current or quiet_now()):
+            continue  # плановый звонок не нужен: уже на линии или тихие часы
+        if any(i.get("checkin") for i in items) and not all(i.get("checkin") for i in items):
+            items = [i for i in items if not i.get("checkin")]  # есть настоящие новости
         if current:  # Арз уже на линии: просто расскажем
             await current.say("Пришли новые новости, перескажи коротко: " + "; ".join(i["text"] for i in items))
             continue
@@ -568,29 +603,38 @@ async def worker():
             for i in items:
                 await text_arz(i["text"])
             continue
+        checkin_only = all(i.get("checkin") for i in items)
+        last_call = time.time()
         async with call_lock:
             current = CallSession(intro_for(items))
             try:
                 res = await current.run()
             finally:
                 current = None
+                last_call = time.time()
+        if res == "missed" and checkin_only:  # плановый без новостей: текстом не дублируем
+            continue
         if res == "missed":
             for i in items:
+                if i.get("checkin"):
+                    continue
                 await text_arz(i["text"])
             await post_queue("Арз не взял трубку, отправил текстом.")
 
 
 async def incoming(arz_called: ChatUpdate):
     """Арз сам позвонил на @veilvex_manager."""
-    global current
+    global current, last_call
     if current or call_lock.locked():
         return
     async with call_lock:
-        current = CallSession("Арз сам позвонил тебе. Скажи «Слушаю, мистер Арз» и жди, что он скажет.", incoming=True)
+        a = random.choice(("Сэр", "Мистер Арз"))
+        current = CallSession(f"Арз сам позвонил тебе. Скажи «Слушаю, {a}» и жди, что он скажет.", incoming=True)
         try:
             await current.run()
         finally:
             current = None
+            last_call = time.time()
 
 
 # ---------- чат: Арз пишет или шлёт голосовое в @veilvex_manager ----------
@@ -615,6 +659,7 @@ CHAT_SYSTEM = """Ты помощник команды Veilvex в Telegram-чат
 - pozvonit: когда Арз просит позвонить ему (сейчас или через N минут). Его просьбу выполняем и ночью.
 - tihie_chasy: когда Арз меняет время, когда ему не звонить. Сейчас тихие часы: {quiet} МСК
   (в это время новости приходят текстом, а его собственные звонки принимаем всегда).
+- chastota_zvonkov: когда Арз просит звонить чаще/реже или «только по новостям» (0). Сейчас: {checkin}.
 - golos_zvonka: когда Арз выбирает голос цифрой 1-4 («голос 3», «ставь второй») или просит убрать/вернуть электронный оттенок. После смены предложи пробный звонок.
 - format_otveta: когда Арз просит ответить голосом / голосовым / «скажи вслух» (golos=true) или текстом
   (golos=false). Если просит «всегда отвечай голосом» или «всегда текстом», ставь vsegda=true.
@@ -652,6 +697,10 @@ CHAT_TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "nomer": {"type": "integer", "description": "Номер образца 1-4"},
          "effekt": {"type": "boolean", "description": "true = с электронным оттенком, false = чистый голос"}}}},
+    {"name": "chastota_zvonkov",
+     "description": "Как часто звонить Арзу плановым звонком, если новостей нет (минуты). 0 = только по новостям.",
+     "input_schema": {"type": "object", "properties": {
+         "minuty": {"type": "number"}}, "required": ["minuty"]}},
     {"name": "pozvonit",
      "description": "Позвонить Арзу голосом в Telegram: сейчас (minuty=0) или через N минут.",
      "input_schema": {"type": "object", "properties": {
@@ -759,6 +808,14 @@ async def run_chat_tool(name, args):
         save_state(state)
         chat_done.append(f"тихие часы: {state['quiet']}")
         return f"готово, тихие часы {state['quiet']} (МСК)"
+    if name == "chastota_zvonkov":
+        m = max(0.0, float(args.get("minuty") or 0))
+        if 0 < m < 5:
+            m = 5.0
+        state["checkin"] = m
+        save_state(state)
+        chat_done.append(f"плановые звонки: {'каждые %g мин' % m if m else 'выключены'}")
+        return f"готово, плановые звонки {'каждые %g мин' % m if m else 'выключены, звоню только по новостям'}"
     if name == "golos_zvonka":
         out = []
         if args.get("effekt") is not None:
@@ -809,7 +866,9 @@ async def chat_answer(content) -> str:
     fmt = ("всегда голосом" if pref else "всегда текстом") if pref is not None else \
         "на голосовое голосом, на текст текстом"
     sysp = CHAT_SYSTEM.format(now=now_msk().strftime("%d.%m %H:%M"), recent=recent, fmt=fmt,
-                              quiet=state.get("quiet", QUIET_HOURS))
+                              quiet=state.get("quiet", QUIET_HOURS),
+                              checkin=(f"каждые {checkin_min():g} мин, если новостей нет" if checkin_min() > 0
+                                       else "только по новостям"))
     r = None
     for _ in range(6):
         r = await claude.messages.create(model=CHAT_MODEL, max_tokens=3000, system=sysp,
@@ -1133,7 +1192,7 @@ async def main():
         await start_inbox()
     except Exception:
         log.exception("коннектор не запустился, звонки работают без него")
-    await asyncio.gather(worker(), poll_queue(), chat_worker(), tg.run_until_disconnected())
+    await asyncio.gather(worker(), poll_queue(), chat_worker(), checkin_loop(), tg.run_until_disconnected())
 
 
 if __name__ == "__main__":

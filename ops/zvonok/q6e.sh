@@ -1,9 +1,9 @@
 #!/bin/sh
-# Звонилка v6.2: обращение «Сэр»/«Мистер Арз» вперемешку, голос прежний.
+# Звонилка v6.2: «Сэр»/«Мистер Арз», плановый звонок каждые 15 мин, голос прежний.
 # Запуск на Маке: sh ~/Ассистент/veilvex-calls/q6e.sh
 cd ~/Ассистент/veilvex-calls || exit 1
 SHA=${SHA:-main}
-WANT=cbe741d3d3be338d6917daf378400f15
+WANT=2dba83cb6a0e4cabc1881daed1469f9b
 curl -fsSL "https://raw.githubusercontent.com/Veilvex/small-business-websites-study/$SHA/ops/zvonok/zvonok.py" -o zvonok.py.new || { echo "не скачалось"; exit 1; }
 GOT=$(md5 -q zvonok.py.new 2>/dev/null || md5sum zvonok.py.new | cut -d' ' -f1)
 [ "$GOT" = "$WANT" ] || { echo "файл не тот ($GOT)"; exit 1; }
