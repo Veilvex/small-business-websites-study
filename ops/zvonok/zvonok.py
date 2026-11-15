@@ -9,17 +9,23 @@
 - Арз может сам позвонить на @veilvex_manager: сервис возьмёт трубку.
 - Арз пишет или шлёт голосовое в чат: отвечаем текстом или голосовым (как спросил),
   поручения уходят в канал-очередь как «📌 Задача от Арза из чата», команда их забирает.
+- v6: сервис сам работает как маленький Telegram-коннектор для тредов (вместо Amvera):
+  инструменты send_message / get_history, но ТОЛЬКО для чата Арза и канала-очереди.
+  Адрес секретный (INBOX_SECRET в пути), порт INBOX_PORT, за Cloudflare.
 """
 import asyncio
+import hmac
 import json
 import logging
 import os
+import ssl
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anthropic
 import aiohttp
+from aiohttp import web
 import numpy as np
 from google import genai
 from google.genai import types as gt
@@ -62,6 +68,10 @@ NOISE_GATE = float(env("NOISE_GATE", "900"))  # пока бот говорит, 
 QUIET_HOURS = env("QUIET_HOURS", "") or "22-10"  # Арз 11.11: с 22 до 10 МСК не звоним, шлём текстом
 STATE = Path(env("STATE_FILE", "state.json"))
 BOT_MARK = "🤖"  # сообщения сервиса в очереди, их не обрабатываем
+INBOX_SECRET = env("INBOX_SECRET", "")   # пусто = коннектор выключен
+INBOX_PORT = int(env("INBOX_PORT", "2096"))
+INBOX_CERT = env("INBOX_CERT", "inbox.crt")
+INBOX_KEY = env("INBOX_KEY", "inbox.key")
 
 SR_TG = 48000          # Telegram: 48 кГц моно, 16 бит
 FRAME_10MS = SR_TG * 2 // 100
@@ -841,6 +851,172 @@ async def chat_worker():
             log.exception("chat_worker")
 
 
+# ---------- коннектор для тредов (v6, вместо Amvera) ----------
+# Только два чата: Арз (оповещение = звонок) и канал-очередь. Остальной аккаунт недоступен.
+def chat_kind(chat_id):
+    s = str(chat_id).strip().lstrip("@").lower()
+    if s in (str(ARZ_ID), "arzik_k"):
+        return "arz"
+    q = str(abs(QUEUE_CHAT))            # 1004477257195
+    short = q[3:] if q.startswith("100") else q
+    if s.lstrip("-") in (q, short):
+        return "queue"
+    return None
+
+
+TOOLS = [
+    {"name": "send_message",
+     "description": "Оповещение Арзу: chat_id 7230838320 (сначала звонок, если не возьмёт, придёт текстом; "
+                    "в тихие часы сразу текст). Или сообщение в канал-очередь звонков: chat_id -1004477257195. "
+                    "Другие чаты этим коннектором недоступны.",
+     "inputSchema": {"type": "object", "properties": {
+         "chat_id": {"type": ["integer", "string"]}, "message": {"type": "string"}},
+         "required": ["chat_id", "message"]}},
+    {"name": "get_history",
+     "description": "Последние сообщения канала-очереди (-1004477257195) или чата Арза (7230838320), новые сверху.",
+     "inputSchema": {"type": "object", "properties": {
+         "chat_id": {"type": ["integer", "string"]}, "limit": {"type": "integer", "default": 20}},
+         "required": ["chat_id"]}},
+    {"name": "get_messages",
+     "description": "То же, что get_history (для совместимости).",
+     "inputSchema": {"type": "object", "properties": {
+         "chat_id": {"type": ["integer", "string"]}, "page_size": {"type": "integer", "default": 20}},
+         "required": ["chat_id"]}},
+    {"name": "get_me", "description": "Какой аккаунт отвечает.",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+sent_times = []  # защита от лавины: не больше 30 сообщений за 10 минут
+
+
+async def mcp_tool(name, a):
+    if name == "get_me":
+        me = await tg.get_me()
+        return f"@{me.username} (id {me.id}), коннектор звонилки: только чат Арза и канал-очередь"
+    kind = chat_kind(a.get("chat_id", ""))
+    if not kind:
+        raise ValueError("этот коннектор пишет и читает только чат Арза (7230838320) и канал-очередь (-1004477257195)")
+    peer = ARZ_ID if kind == "arz" else QUEUE_CHAT
+    if name in ("get_history", "get_messages"):
+        n = max(1, min(int(a.get("limit") or a.get("page_size") or 20), 100))
+        msgs = await tg.get_messages(peer, limit=n)
+        lines = [f"ID: {m.id} | Date: {m.date.astimezone(MSK):%Y-%m-%d %H:%M} МСК | "
+                 f"From: {'Арз' if m.sender_id == ARZ_ID else '@veilvex_manager'} | Message: {m.message or '(медиа)'}"
+                 for m in msgs]
+        return "\n".join(lines) or "сообщений нет"
+    if name == "send_message":
+        t = str(a.get("message", "")).strip()[:4000]
+        if not t:
+            raise ValueError("пустое сообщение")
+        now = time.time()
+        sent_times[:] = [x for x in sent_times if now - x < 600] + [now]
+        if len(sent_times) > 30:
+            raise ValueError("слишком много сообщений за 10 минут, подожди")
+        if kind == "queue":
+            m = await tg.send_message(QUEUE_CHAT, t)
+            return f"Message sent to queue (id {m.id}). Звонилка возьмёт его в работу."
+        if is_notice(t):
+            await notice_q.put({"callback": False, "text": t})
+            return "Message accepted: сначала звонок Арзу, если не возьмёт, придёт текстом."
+        await text_arz(t)
+        return "Message sent to Arz as text."
+    raise ValueError(f"нет инструмента {name}")
+
+
+async def mcp_one(m):
+    mid, meth = m.get("id"), m.get("method", "")
+    if mid is None:
+        return None  # уведомление, ответ не нужен
+
+    def ok(res):
+        return {"jsonrpc": "2.0", "id": mid, "result": res}
+    if meth == "initialize":
+        pv = (m.get("params") or {}).get("protocolVersion") or "2025-06-18"
+        return ok({"protocolVersion": pv, "capabilities": {"tools": {"listChanged": False}},
+                   "serverInfo": {"name": "veilvex-zvonok", "version": "6"}})
+    if meth == "ping":
+        return ok({})
+    if meth == "tools/list":
+        return ok({"tools": TOOLS})
+    if meth in ("resources/list", "prompts/list"):
+        return ok({meth.split("/")[0]: []})
+    if meth == "tools/call":
+        p = m.get("params") or {}
+        try:
+            text, err = await mcp_tool(p.get("name"), p.get("arguments") or {}), False
+        except Exception as e:
+            text, err = f"Ошибка: {e}", True
+        log.info("коннектор: %s -> %s", p.get("name"), "ошибка" if err else "ок")
+        return ok({"content": [{"type": "text", "text": text}], "isError": err})
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}}
+
+
+async def mcp_http(request):
+    if not hmac.compare_digest(request.match_info.get("secret", ""), INBOX_SECRET):
+        return web.Response(status=404)
+    if request.method == "DELETE":
+        return web.Response(status=200)
+    if request.method != "POST":
+        return web.Response(status=405)
+    try:
+        msg = await request.json()
+    except Exception:
+        return web.json_response({"jsonrpc": "2.0", "id": None,
+                                  "error": {"code": -32700, "message": "parse error"}}, status=400)
+    batch = msg if isinstance(msg, list) else [msg]
+    out = [r for r in [await mcp_one(x) for x in batch if isinstance(x, dict)] if r is not None]
+    if not out:
+        return web.Response(status=202)
+    return web.json_response(out if isinstance(msg, list) else out[0])
+
+
+async def start_inbox():
+    """Публичный порт: смотрим первый байт и отдаём во внутренний HTTPS (если TLS) или HTTP.
+    Так работает при любом режиме SSL в Cloudflare (Full или Flexible)."""
+    if not INBOX_SECRET:
+        log.info("коннектор выключен (нет INBOX_SECRET)")
+        return
+    app = web.Application(client_max_size=256 * 1024)
+    app.router.add_route("*", "/{secret}/mcp", mcp_http)
+    runner = web.AppRunner(app, access_log=None)  # без логов: секрет в адресе
+    await runner.setup()
+    plain_port, tls_port = INBOX_PORT + 20000, None
+    await web.TCPSite(runner, "127.0.0.1", plain_port).start()
+    if Path(INBOX_CERT).exists() and Path(INBOX_KEY).exists():
+        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ctx.load_cert_chain(INBOX_CERT, INBOX_KEY)
+        tls_port = INBOX_PORT + 21000
+        await web.TCPSite(runner, "127.0.0.1", tls_port, ssl_context=ctx).start()
+
+    async def pipe(a, b):
+        try:
+            while True:
+                d = await a.read(65536)
+                if not d:
+                    break
+                b.write(d)
+                await b.drain()
+        except Exception:
+            pass
+        finally:
+            b.close()
+
+    async def sniff(r, w):
+        try:
+            first = await asyncio.wait_for(r.read(1), 20)
+            if not first:
+                w.close()
+                return
+            port = tls_port if (first == b"\x16" and tls_port) else plain_port
+            ur, uw = await asyncio.open_connection("127.0.0.1", port)
+            uw.write(first)
+            await asyncio.gather(pipe(r, uw), pipe(ur, w))
+        except Exception:
+            w.close()
+
+    await asyncio.start_server(sniff, "0.0.0.0", INBOX_PORT)
+    log.info("коннектор слушает порт %s (TLS: %s)", INBOX_PORT, "да" if tls_port else "нет")
+
+
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     await tg.start()
@@ -897,6 +1073,10 @@ async def main():
         state["last_id"] = last[0].id if last else 0
         save_state(state)
     await pick_live_model()
+    try:
+        await start_inbox()
+    except Exception:
+        log.exception("коннектор не запустился, звонки работают без него")
     await asyncio.gather(worker(), poll_queue(), chat_worker(), tg.run_until_disconnected())
 
 
