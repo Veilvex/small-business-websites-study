@@ -60,6 +60,7 @@ ANTHROPIC_KEY = env("ANTHROPIC_API_KEY")
 LIVE_MODELS = env("LIVE_MODELS", "gemini-3.8-live,gemini-3.1-flash-live-preview,"
                   "gemini-2.5-flash-native-audio-latest").split(",")
 VOICE = env("VOICE", "Sadaltager")
+VOICES = {1: "Sadaltager", 2: "Charon", 3: "Iapetus", 4: "Algenib"}  # образцы golos-1..4.mp3 для Арза
 RING_SEC = int(env("RING_SEC", "45"))
 BATCH_WAIT = int(env("BATCH_WAIT", "15"))
 SILENCE_ASK_MIN = float(env("SILENCE_ASK_MIN", "3"))
@@ -157,6 +158,10 @@ async def post_queue(text):
 
 own_texts = set()  # тексты, которые шлёт сам сервис (их не перехватываем)
 callback_task = None  # один запланированный перезвон: новая просьба заменяет старую
+
+
+def cur_voice() -> str:
+    return state.get("voice") or VOICE
 
 
 def is_notice(t: str) -> bool:
@@ -322,7 +327,7 @@ class CallSession:
             response_modalities=["AUDIO"],
             system_instruction=SYSTEM.format(recent=recent),
             speech_config=gt.SpeechConfig(voice_config=gt.VoiceConfig(
-                prebuilt_voice_config=gt.PrebuiltVoiceConfig(voice_name=VOICE))),
+                prebuilt_voice_config=gt.PrebuiltVoiceConfig(voice_name=cur_voice()))),
             tools=TOOLS,
             input_audio_transcription=gt.AudioTranscriptionConfig(),
             output_audio_transcription=gt.AudioTranscriptionConfig(),
@@ -587,6 +592,7 @@ CHAT_SYSTEM = """Ты помощник команды Veilvex в Telegram-чат
 - pozvonit: когда Арз просит позвонить ему (сейчас или через N минут). Его просьбу выполняем и ночью.
 - tihie_chasy: когда Арз меняет время, когда ему не звонить. Сейчас тихие часы: {quiet} МСК
   (в это время новости приходят текстом, а его собственные звонки принимаем всегда).
+- golos_zvonka: когда Арз выбирает голос цифрой 1-4 («голос 3», «ставь второй»). После смены предложи пробный звонок.
 - format_otveta: когда Арз просит ответить голосом / голосовым / «скажи вслух» (golos=true) или текстом
   (golos=false). Если просит «всегда отвечай голосом» или «всегда текстом», ставь vsegda=true.
   Сейчас по умолчанию: {fmt}.
@@ -617,6 +623,11 @@ CHAT_TOOLS = [
          "s": {"type": "integer", "description": "С какого часа не звонить, 0-23"},
          "do": {"type": "integer", "description": "До какого часа, 0-23"},
          "vykl": {"type": "boolean", "description": "true = звонить в любое время"}}}},
+    {"name": "golos_zvonka",
+     "description": "Сменить голос в звонках и голосовых: образец 1-4 (1 Sadaltager, 2 Charon, 3 Iapetus, 4 Algenib).",
+     "input_schema": {"type": "object", "properties": {
+         "nomer": {"type": "integer", "description": "Номер образца 1-4"}},
+         "required": ["nomer"]}},
     {"name": "pozvonit",
      "description": "Позвонить Арзу голосом в Telegram: сейчас (minuty=0) или через N минут.",
      "input_schema": {"type": "object", "properties": {
@@ -673,7 +684,7 @@ async def text_to_voice(text: str) -> bytes:
                 config=gt.GenerateContentConfig(
                     response_modalities=["AUDIO"],
                     speech_config=gt.SpeechConfig(voice_config=gt.VoiceConfig(
-                        prebuilt_voice_config=gt.PrebuiltVoiceConfig(voice_name=VOICE)))))
+                        prebuilt_voice_config=gt.PrebuiltVoiceConfig(voice_name=cur_voice())))))
             part = r.candidates[0].content.parts[0].inline_data
             rate = 24000
             if part.mime_type and "rate=" in part.mime_type:
@@ -723,6 +734,14 @@ async def run_chat_tool(name, args):
         save_state(state)
         chat_done.append(f"тихие часы: {state['quiet']}")
         return f"готово, тихие часы {state['quiet']} (МСК)"
+    if name == "golos_zvonka":
+        n = int(args.get("nomer") or 0)
+        if n not in VOICES:
+            return "такого номера нет, есть 1-4"
+        state["voice"] = VOICES[n]
+        save_state(state)
+        chat_done.append(f"голос звонков: {n} ({VOICES[n]})")
+        return f"готово, теперь голос {n}"
     if name == "pozvonit":
         mins = float(args.get("minuty") or 0)
         why = args.get("zachem", "")
