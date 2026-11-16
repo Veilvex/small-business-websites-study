@@ -9,6 +9,7 @@
 - Арз может сам позвонить на @veilvex_manager: сервис возьмёт трубку.
 - Арз пишет или шлёт голосовое в чат: отвечаем текстом или голосовым (как спросил),
   поручения уходят в канал-очередь как «📌 Задача от Арза из чата», команда их забирает.
+- v7: без Claude. Чат и «перезвоню» отвечают через Gemini с перебором моделей (CHAT_MODELS), интернета нет.
 - v6: сервис сам работает как маленький Telegram-коннектор для тредов (вместо Amvera):
   инструменты send_message / get_history, но ТОЛЬКО для чата Арза и канала-очереди.
   Адрес секретный (INBOX_SECRET в пути), порт INBOX_PORT, за Cloudflare.
@@ -24,7 +25,6 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import anthropic
 import aiohttp
 from aiohttp import web
 import numpy as np
@@ -56,7 +56,6 @@ SESSION = env("TG_SESSION")
 ARZ_ID = int(env("ARZ_ID", "7230838320"))
 QUEUE_CHAT = int(env("QUEUE_CHAT"))
 GEMINI_KEY = env("GEMINI_API_KEY")
-ANTHROPIC_KEY = env("ANTHROPIC_API_KEY")
 LIVE_MODELS = env("LIVE_MODELS", "gemini-3.8-live,gemini-3.1-flash-live-preview,"
                   "gemini-2.5-flash-native-audio-latest").split(",")
 VOICE = env("VOICE", "Charon")
@@ -162,7 +161,6 @@ def rms(pcm: bytes) -> float:
 tg = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 calls = PyTgCalls(tg)
 gem = genai.Client(api_key=GEMINI_KEY, http_options={"api_version": "v1beta"})  # Live в v1 даёт 404
-claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
 
 notice_q: asyncio.Queue = asyncio.Queue()
 current = None          # активный разговор (CallSession) или None
@@ -208,8 +206,9 @@ SYSTEM = """Ты голосовой помощник команды Veilvex. Т�
 - Никогда не прощайся первым и не заканчивай разговор: трубку кладёт только Арз.
   Когда новости рассказаны, спроси, есть ли вопросы или указания, и жди.
 - Если Арз спрашивает то, что знаешь из новостей ниже, отвечай сразу.
-- Если нужен поиск в интернете, расчёт, проверка или что-то долгое: скажи «Понял, займусь и перезвоню»
-  и вызови функцию dolgaya_zadacha с kind="poisk".
+- Если нужен расчёт, объяснение или подробный ответ, на который нужно время: скажи «Понял, займусь и перезвоню»
+  и вызови функцию dolgaya_zadacha с kind="poisk". Интернета у тебя нет: если нужны свежие данные из интернета
+  (цены, новости, проверка сайта или бота), передай это команде через kind="komanda".
 - Если Арз просит перезвонить позже: вызови perezvonit с числом минут и скажи, во сколько перезвонишь.
 - Если Арз даёт поручение команде (поменять что-то на сайте, написать клиенту, запустить работу):
   повтори поручение одной фразой, вызови dolgaya_zadacha с kind="komanda" и скажи, что передал команде.
@@ -490,23 +489,86 @@ class CallSession:
         return "answered"
 
 
+# ---------- Gemini: текстовые ответы с перебором моделей ----------
+CHAT_MODELS = [m.strip() for m in env(
+    "CHAT_MODELS", "gemini-4-hydrogen,gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,"
+                   "gemini-3-flash-preview,gemini-3.5-flash-lite,gemma-4-31b-it").split(",") if m.strip()]
+GEMINI_SEARCH = env("GEMINI_SEARCH", "0") == "1"  # на бесплатном ключе поиска Google нет
+model_rest = {}  # модель → до какого времени её не трогать (лимит, перегрузка, недоступна)
+
+
+def rest_model(model, e):
+    code = getattr(e, "code", None)
+    msg = str(getattr(e, "message", None) or e).lower()
+    if code == 429:
+        sec = 6 * 3600 if ("perday" in msg or "per day" in msg or "daily" in msg) else 90
+    elif code in (403, 404):
+        sec = 6 * 3600  # модели нет у этого ключа
+    else:
+        sec = 60  # 5xx, таймаут, плохой ответ
+    model_rest[model] = time.time() + sec
+
+
+def no_system(model) -> bool:
+    return model.startswith("gemma")  # у Gemma может не быть системной инструкции: кладём её в первый запрос
+
+
+async def gem_generate(contents, system=None, tools=None, pinned=None, models=None):
+    """Запрос к Gemini с перебором моделей по очереди. Возвращает (ответ, модель)."""
+    order = ([pinned] if pinned else []) + [m for m in (models or CHAT_MODELS) if m != pinned]
+    now = time.time()
+    ready = [m for m in order if model_rest.get(m, 0) <= now]
+    if not ready:  # все отдыхают: берём тех, кому осталось меньше всего
+        ready = sorted(order, key=lambda m: model_rest.get(m, 0))[:3]
+    last = None
+    for attempt in range(2):
+        again = []
+        for m in ready:
+            try:
+                cont = contents
+                cfg = gt.GenerateContentConfig(max_output_tokens=4000, tools=tools or None)
+                if system and no_system(m):
+                    cont = [gt.Content(role="user", parts=[gt.Part(text="Инструкция для тебя:\n" + system)]),
+                            gt.Content(role="model", parts=[gt.Part(text="Понял, действую по инструкции.")])
+                            ] + list(contents)
+                elif system:
+                    cfg.system_instruction = system
+                r = await asyncio.wait_for(gem.aio.models.generate_content(model=m, contents=cont, config=cfg), 90)
+                if not r.candidates or not r.candidates[0].content or not r.candidates[0].content.parts:
+                    raise RuntimeError("пустой ответ")
+                return r, m
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last = e
+                rest_model(m, e)
+                if getattr(e, "code", None) not in (400, 403, 404, 429):
+                    again.append(m)  # перегрузка или таймаут: попробуем ещё раз
+                log.warning("Gemini %s: %s", m, str(e)[:200])
+        if not again:
+            break
+        ready = again
+        await asyncio.sleep(4)
+    raise RuntimeError(f"ни одна модель не ответила: {str(last)[:200]}")
+
+
+def gem_text(r) -> str:
+    parts = r.candidates[0].content.parts or []
+    return "".join(p.text for p in parts if p.text and not getattr(p, "thought", False))
+
+
 # ---------- фоновые задачи «перезвоню» ----------
 async def background_research(task: str):
     log.info("фоновая задача: %s", task)
     try:
-        msgs = [{"role": "user", "content":
-                 "Ответь по-русски, коротко (до 5 предложений), с цифрами и фактами, без выдумок. "
-                 f"Это ответ владельцу бизнеса по телефону. Вопрос: {task}"}]
-        for _ in range(3):  # pause_turn у веб-поиска
-            r = await claude.messages.create(
-                model="claude-opus-5-5", max_tokens=4000,
-                output_config={"effort": "medium"},
-                tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}],
-                messages=msgs)
-            if r.stop_reason != "pause_turn":
-                break
-            msgs.append({"role": "assistant", "content": r.content})
-        answer = "".join(b.text for b in r.content if b.type == "text").replace("*", "").strip() or "Не нашёл ответа."
+        q = ("Ответь по-русски, коротко (до 5 предложений), по делу, без выдумок. "
+             "Это ответ владельцу бизнеса по телефону. Интернета у тебя нет: свежие цены, новости и состояние "
+             "сайтов или серверов не придумывай, а прямо скажи, что для точного ответа нужно дать поручение команде. "
+             "Не обещай, что команда уже этим занимается. "
+             f"Вопрос: {task}")
+        tools = [gt.Tool(google_search=gt.GoogleSearch())] if GEMINI_SEARCH else None
+        r, _ = await gem_generate([gt.Content(role="user", parts=[gt.Part(text=q)])], tools=tools)
+        answer = gem_text(r).replace("*", "").strip() or "Не нашёл ответа."
     except Exception as e:
         log.exception("research")
         answer = f"Не получилось найти ответ ({type(e).__name__})."
@@ -638,10 +700,9 @@ async def incoming(arz_called: ChatUpdate):
 
 
 # ---------- чат: Арз пишет или шлёт голосовое в @veilvex_manager ----------
-STT_MODELS = env("STT_MODELS", "gemini-3.5-flash,gemini-2.5-flash,gemini-3.8-flash").split(",")
+STT_MODELS = env("STT_MODELS", "gemini-3.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash,gemini-3.8-flash").split(",")
 TTS_MODELS = env("TTS_MODELS", "gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts,"
                  "gemini-3.8-flash-tts").split(",")
-CHAT_MODEL = env("CHAT_MODEL", "claude-opus-5-5")
 CHAT_WAIT = float(env("CHAT_WAIT", "3"))  # подождать, вдруг Арз пишет несколько сообщений подряд
 
 chat_q: asyncio.Queue = asyncio.Queue()
@@ -649,10 +710,12 @@ chat_q: asyncio.Queue = asyncio.Queue()
 CHAT_SYSTEM = """Ты помощник команды Veilvex в Telegram-чате с владельцем, его зовут Арз.
 Отвечай только по-русски (если Арз пишет по-азербайджански, отвечай по-азербайджански).
 Пиши коротко и по-человечески, как в мессенджере: 1-4 предложения, без markdown, без звёздочек, без списков,
-если можно без них. Обращение только в начале разговора, случайно то «Сэр», то «Мистер Арз», дальше просто по делу.
+если можно без них. Обращение только в начале разговора, случайно то «Сэр», то «Мистер Арз» (не просто «Арз»),
+дальше просто по делу. На простые вопросы о делах отвечай сам по новостям ниже, команде передавай только поручения.
 Что ты умеешь:
 - Отвечать на вопросы про работу команды по новостям ниже. Не знаешь: так и скажи.
-- Искать в интернете (web_search), когда нужны свежие факты, цены, новости.
+- Интернета у тебя нет. Свежие факты, цены, новости и состояние сайтов не выдумывай: если это нужно узнать,
+  передай вопрос команде офиса через peredat_komande и скажи, что ответ придёт от них.
 - peredat_komande: когда Арз даёт поручение (сделать что-то на сайте, написать клиенту, найти, запустить
   работу, поменять настройку). Сформулируй задачу полностью, со всеми деталями из его слов,
   вызови инструмент и коротко скажи, что передал команде и они займутся.
@@ -673,9 +736,8 @@ CHAT_SYSTEM = """Ты помощник команды Veilvex в Telegram-чат
 """
 
 CHAT_TOOLS = [
-    {"type": "web_search_20260209", "name": "web_search", "max_uses": 5},
     {"name": "peredat_komande",
-     "description": "Передать поручение Арза команде агентов Claude. Они возьмут его в работу и сообщат результат.",
+     "description": "Передать поручение Арза команде офиса. Они возьмут его в работу и сообщат результат.",
      "input_schema": {"type": "object", "properties": {
          "zadacha": {"type": "string", "description": "Поручение полностью, по-русски, со всеми деталями"}},
          "required": ["zadacha"]}},
@@ -847,21 +909,29 @@ async def run_chat_tool(name, args):
     return "нет такого инструмента"
 
 
+CHAT_GEM_TOOLS = [gt.Tool(function_declarations=[
+    gt.FunctionDeclaration(name=t["name"], description=t["description"], parameters_json_schema=t["input_schema"])
+    for t in CHAT_TOOLS])]
+
+
 async def chat_answer(content) -> str:
-    """content: блоки сообщения Арза для Claude. Возвращает текст ответа."""
+    """content: части сообщения Арза ({"text": ...} или {"image": bytes, "mime": ...}). Возвращает текст ответа."""
     recent = "\n".join(f"{r['t']}: {r['x']}" for r in state["recent"][-15:]) or "пока нет"
-    msgs = []
+    hist = []
     for h in chat_history()[-12:]:
-        role = "user" if h["r"] == "arz" else "assistant"
-        if msgs and msgs[-1]["role"] == role:
-            msgs[-1]["content"] += "\n" + h["x"]
+        role = "user" if h["r"] == "arz" else "model"
+        if hist and hist[-1][0] == role:
+            hist[-1][1] += "\n" + h["x"]
         else:
-            msgs.append({"role": role, "content": h["x"]})
-    if msgs and msgs[0]["role"] == "assistant":
-        msgs = msgs[1:]
-    if msgs and msgs[-1]["role"] == "user":  # последнее сообщение Арза пришлём ниже с картинками
-        msgs.pop()
-    msgs.append({"role": "user", "content": content})
+            hist.append([role, h["x"]])
+    if hist and hist[0][0] == "model":
+        hist = hist[1:]
+    if hist and hist[-1][0] == "user":  # последнее сообщение Арза пришлём ниже с картинками
+        hist.pop()
+    contents = [gt.Content(role=role, parts=[gt.Part(text=x)]) for role, x in hist]
+    last = [gt.Part.from_bytes(data=b["image"], mime_type=b.get("mime") or "image/jpeg") if "image" in b
+            else gt.Part(text=b["text"]) for b in content]
+    contents.append(gt.Content(role="user", parts=last))
     pref = state.get("voice_pref")
     fmt = ("всегда голосом" if pref else "всегда текстом") if pref is not None else \
         "на голосовое голосом, на текст текстом"
@@ -869,28 +939,31 @@ async def chat_answer(content) -> str:
                               quiet=state.get("quiet", QUIET_HOURS),
                               checkin=(f"каждые {checkin_min():g} мин, если новостей нет" if checkin_min() > 0
                                        else "только по новостям"))
-    r = None
+    r, model, text = None, None, ""
     for _ in range(6):
-        r = await claude.messages.create(model=CHAT_MODEL, max_tokens=3000, system=sysp,
-                                         output_config={"effort": "medium"}, tools=CHAT_TOOLS, messages=msgs)
-        if r.stop_reason == "pause_turn":
-            msgs.append({"role": "assistant", "content": r.content})
-            continue
-        if r.stop_reason == "tool_use":
-            msgs.append({"role": "assistant", "content": r.content})
-            results = []
-            for b in r.content:
-                if b.type == "tool_use":
-                    try:
-                        out = await run_chat_tool(b.name, b.input or {})
-                    except Exception as e:
-                        out = f"ошибка: {e}"
-                    results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
-            msgs.append({"role": "user", "content": results})
-            continue
-        break
-    text = "".join(b.text for b in r.content if b.type == "text") if r else ""
-    return text.replace("**", "").replace("*", "").strip() or "Понял."
+        try:
+            r, model = await gem_generate(contents, system=sysp, tools=CHAT_GEM_TOOLS, pinned=model)
+        except Exception:
+            if chat_done:  # инструменты уже сработали, а итоговая фраза не получилась
+                return "Готово: " + "; ".join(d.rstrip(". ") for d in chat_done) + "."
+            raise
+        text = gem_text(r)
+        fcs = r.function_calls or []
+        if not fcs:
+            break
+        contents.append(r.candidates[0].content)  # как есть: внутри подписи мыслей модели
+        outs = []
+        for fc in fcs:
+            try:
+                out = await run_chat_tool(fc.name, dict(fc.args or {}))
+            except Exception as e:
+                out = f"ошибка: {e}"
+            outs.append(gt.Part.from_function_response(name=fc.name, response={"result": out}))
+        contents.append(gt.Content(role="user", parts=outs))
+    text = text.replace("**", "").replace("*", "").strip()
+    if not text and chat_done:
+        return "Готово: " + "; ".join(d.rstrip(". ") for d in chat_done) + "."
+    return text or "Понял."
 
 
 async def handle_chat(batch):
@@ -905,11 +978,9 @@ async def handle_chat(batch):
                 said = await speech_to_text(data, mime)
                 plain.append(f"(голосом) {said}")
             elif m.photo or (m.document and (m.file.mime_type or "").startswith("image/")):
-                import base64
                 data = await m.download_media(file=bytes)
                 mime = m.file.mime_type if m.document else "image/jpeg"
-                parts.append({"type": "image", "source": {"type": "base64", "media_type": mime,
-                                                          "data": base64.b64encode(data).decode()}})
+                parts.append({"image": data, "mime": mime})
                 plain.append(f"(картинка) {m.message or ''}".strip())
             elif m.message:
                 plain.append(m.message)
@@ -927,7 +998,7 @@ async def handle_chat(batch):
     log.info("чат от Арза: %s", said[:120])
     try:
         async with tg.action(ARZ_ID, "record-voice" if voice_in else "typing"):
-            answer = await chat_answer(parts + [{"type": "text", "text": said or "(без текста)"}])
+            answer = await chat_answer(parts + [{"text": said or "(без текста)"}])
             ogg = None
             pref = state.get("voice_pref")
             if chat_fmt["voice"] is not None:
