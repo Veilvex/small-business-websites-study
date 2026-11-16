@@ -9,6 +9,7 @@
 - Арз может сам позвонить на @veilvex_manager: сервис возьмёт трубку.
 - Арз пишет или шлёт голосовое в чат: отвечаем текстом или голосовым (как спросил),
   поручения уходят в канал-очередь как «📌 Задача от Арза из чата», команда их забирает.
+- v7.1: сообщение в очереди «🤖 📝 текст» = тихая заметка офиса: попадает в «последние новости», без звонка.
 - v7: без Claude. Чат и «перезвоню» отвечают через Gemini с перебором моделей (CHAT_MODELS), интернета нет.
 - v6: сервис сам работает как маленький Telegram-коннектор для тредов (вместо Amvera):
   инструменты send_message / get_history, но ТОЛЬКО для чата Арза и канала-очереди.
@@ -69,6 +70,7 @@ NOISE_GATE = float(env("NOISE_GATE", "900"))  # пока бот говорит, 
 QUIET_HOURS = env("QUIET_HOURS", "") or "22-10"  # Арз 11.11: с 22 до 10 МСК не звоним, шлём текстом
 STATE = Path(env("STATE_FILE", "state.json"))
 BOT_MARK = "🤖"  # сообщения сервиса в очереди, их не обрабатываем
+NOTE_MARK = "🤖 📝"  # тихая заметка офиса в очереди: запомнить как новость, но не звонить и не писать Арзу
 INBOX_SECRET = env("INBOX_SECRET", "")   # пусто = коннектор выключен
 INBOX_PORT = int(env("INBOX_PORT", "2096"))
 INBOX_CERT = env("INBOX_CERT", "inbox.crt")
@@ -585,6 +587,11 @@ async def take_message(msg):
         return
     state["last_id"] = msg.id
     save_state(state)
+    if msg.message.startswith(NOTE_MARK):  # v7.1: сводка офиса для плановых звонков и ответов в чате
+        note = msg.message[len(NOTE_MARK):].strip()[:600]
+        if note:
+            remember(note)
+        return
     if msg.message.startswith(BOT_MARK):
         return
     await notice_q.put({"callback": False, "text": msg.message})
